@@ -10,6 +10,134 @@ import os
 import random
 import time
 
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def save_report2txt(report, title='noise', path='/home/benzischeap/ParlAI/result/', filetype='.txt'):
+    with open(path+title+filetype, 'w') as text_file:
+        text_file.write(report)
+
+def plot_result(report, title='noise', path='/home/benzischeap/ParlAI/result/', filetype='.png'):
+    #title = 'Natural_noise'
+    keys=[]
+    for k in report[0].keys():
+        keys.append(k)
+    #print('keys:',keys)
+
+    plot = []
+    for i in range(len(keys)):
+        plot.append([tmp[keys[i]] for tmp in report])
+    #print('plot:',plot)
+
+    N = np.arange(0,len(plot[0]))
+    for i in range(len(keys)):
+        plt.plot(N,plot[i],label=keys[i])
+    plt.title(title)
+    plt.legend()
+    # save the plot
+    plt.savefig(path+title+filetype)
+
+def noise_op(observations, op, batchsize, dict, original_x, l, text_file=None):
+    for i in range(batchsize):
+        print('original-',i,':',observations[i]['text'])
+        if text_file:
+            text_file.write('original-'+str(i)+': '+observations[i]['text']+'\n')
+        original_x.append((i,observations[i]['text']))
+        if observations[i]['text']!='<SILENCE>' and l!=0:
+            if 'text' in observations[i].keys():
+                text_split = original_x[-1][1].split(' ')
+                n = random.randint(0,len(text_split)-1)
+                word = text_split[n]
+                if op=='natural':
+                    w = natural(word)
+                elif op=='random_middle':
+                    w = random_middle(word)
+                elif op=='fully_random':
+                    w = fully_random(word)
+                elif op=='swap':
+                    w = swap(word)
+                elif op=='key':
+                    w = key(word)
+                text_split[n] = w
+                scramble_x = ' '.join(text_split)
+                observations[i]['text'] = scramble_x
+                observations[i]['text2vec'] = dict.txt2vec(observations[i]['text'])
+                print('noise-',i,':',observations[i]['text'])
+                if text_file:
+                    text_file.write('noise-'+str(i)+': '+observations[i]['text']+'\n')
+    return observations, original_x
+
+
+def random_middle(w):
+    """
+        Randomly permute the middle of a word (all but first and last char)
+    """    
+    if len(w)>3:
+        middle = list(w[1:len(w)-1])
+        random.shuffle(middle)
+        middle = ''.join(middle)
+        return w[0] + middle + w[len(w) - 1]
+    else:
+        return w
+
+def fully_random(w, percentage=1.0):
+    if random.random() > percentage:
+        return w
+    """
+    Completely random permutation
+    """
+    w = list(w)
+    random.shuffle(w)
+    return ''.join(w)
+
+def swap(w, probability=1.0):
+    """
+    Random swap two letters in the middle of a word
+    """
+    if random.random() > probability:
+        return w
+    if len(w) > 3:
+        w = list(w)
+        i = random.randint(1, len(w) - 3)
+        w[i], w[i+1] = w[i+1], w[i]
+        return ''.join(w)
+    else:
+        return w
+
+def key(w,probability=1.0, key_noise={}):
+    if key_noise=={}:
+        for line in open("/home/benzischeap/ParlAI/data/models/dialog_babi_task5/s2s/noise/en.key"):
+            line = line.split()
+            key_noise[line[0]] = line[1:]
+    if random.random() > probability:
+        return w
+    '''
+    Swap $n$ letters with their nearest keys
+    '''
+    w = list(w)
+    i = random.randint(0,len(w)-1)
+    char = w[i]
+    caps = char.isupper()
+    if char in key_noise:
+        w[i] = key_noise[char.lower()][random.randint(0, len(key_noise[char.lower()]) - 1)]
+        if caps:
+            w[i].upper()
+    return ''.join(w)
+
+def natural(w,probability=1.0, natural_noise={}):
+    if natural_noise=={}:
+        for line in open("/home/benzischeap/ParlAI/data/models/dialog_babi_task5/s2s/noise/en.natural"):
+            line = line.strip().split()
+            natural_noise[line[0]] = line[1:]
+    if random.random() > probability:
+        return w
+    if w in natural_noise:
+        return natural_noise[w][random.randint(0,len(natural_noise[w])-1)]
+    return w
+
 
 def maintain_dialog_history(history, observation, reply='',
                             historyLength=1, useReplies='label_else_model',
@@ -52,6 +180,7 @@ def maintain_dialog_history(history, observation, reply='',
     if 'text' in obs:
         if useStartEndIndices:
             obs['text'] = dict.end_token + ' ' + obs['text']
+
         history['dialog'].extend(parse(obs['text'], splitSentences))
 
     history['episode_done'] = obs['episode_done']
@@ -625,19 +754,6 @@ class OffensiveLanguageDetector(object):
 
         return None
 
-def clip_text(text, max_len):
-    if len(text) > max_len:
-        begin_text = ' '.join(
-            text[:math.floor(0.8 * max_len)].split(' ')[:-1]
-        )
-        end_text = ' '.join(
-            text[(len(text) - math.floor(0.2 * max_len)):].split(' ')[1:]
-        )
-        if len(end_text) > 0:
-            text = begin_text + ' ...\n' + end_text
-        else:
-            text = begin_text + ' ...'
-    return text
 
 def display_messages(msgs, prettify=False, ignore_fields='', max_len=1000):
     """Returns a string describing the set of messages provided
@@ -648,9 +764,7 @@ def display_messages(msgs, prettify=False, ignore_fields='', max_len=1000):
     episode_done = False
     ignore_fields = ignore_fields.split(',')
     for index, msg in enumerate(msgs):
-        if msg is None or (index == 1 and 'agent_reply' in ignore_fields):
-            # We only display the first agent (typically the teacher) if we
-            # are ignoring the agent reply.
+        if msg is None:
             continue
         if msg.get('episode_done'):
             episode_done = True
@@ -661,14 +775,21 @@ def display_messages(msgs, prettify=False, ignore_fields='', max_len=1000):
         # Only display rewards !=0 as they are confusing in non-RL tasks.
         if msg.get('reward', 0) != 0:
             lines.append(space + '[reward: {r}]'.format(r=msg['reward']))
-        for key in msg:
-            if key not in ['episode_done', 'id', 'image', 'text', 'labels', 'eval_labels', 'label_candidates', 'text_candidates', 'reward'] and key not in ignore_fields:
-                line = '[' + key + ']: ' + clip_text(str(msg.get(key)), max_len)
-                lines.append(space + line)
         if type(msg.get('image')) == str:
             lines.append(msg['image'])
         if msg.get('text', ''):
-            text = clip_text(msg['text'], max_len)
+            text = msg['text']
+            if len(text) > max_len:
+                begin_text = ' '.join(
+                    text[:math.floor(0.8 * max_len)].split(' ')[:-1]
+                )
+                end_text = ' '.join(
+                    text[(len(text) - math.floor(0.2 * max_len)):].split(' ')[1:]
+                )
+                if len(end_text) > 0:
+                    text = begin_text + ' ...\n' + end_text
+                else:
+                    text = begin_text + ' ...'
             ID = '[' + msg['id'] + ']: ' if 'id' in msg else ''
             lines.append(space + ID + text)
         if msg.get('labels') and 'labels' not in ignore_fields:
