@@ -7,7 +7,7 @@
 from parlai.core.agents import Agent
 from parlai.core.build_data import modelzoo_path
 from parlai.core.dict import DictionaryAgent
-from parlai.core.utils import maintain_dialog_history, PaddingUtils, round_sigfigs
+from parlai.core.utils import maintain_dialog_history, PaddingUtils, round_sigfigs, noise_op
 from parlai.core.thread_utils import SharedTable
 from .modules import Seq2seq
 
@@ -22,7 +22,9 @@ from collections import deque, defaultdict
 import os
 import math
 import pickle
+import random
 
+from parlai.core.metrics import _exact_match, _f1_score
 
 class Seq2seqAgent(Agent):
     """Agent which takes an input sequence and produces an output sequence.
@@ -182,6 +184,9 @@ class Seq2seqAgent(Agent):
         self.beam_size = opt.get('beam_size', 1)
         self.topk = opt.get('topk', 1)
         states = {}
+
+        self.N = 100
+        self.n_metrics = [ {'loss': 0.0, 'num_tokens': 0, 'correct': 0, 'correct_cnt': 0,'f1':0.0,'f1_cnt':0, 'accuracy':0.0, 'f1_score':0.0} for _ in range(self.N+1)]
 
         # check for cuda
         self.use_cuda = not opt.get('no_cuda') and torch.cuda.is_available()
@@ -351,6 +356,11 @@ class Seq2seqAgent(Agent):
             self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer, 'min', factor=0.5, patience=3, verbose=True)
 
+        # noise
+        self.noise_op = 'fully_random' # natural, random_middle, fully_random, swap, key
+        self.typos = {}
+        self.NN = {}
+
         self.reset()
 
     def override_opt(self, new_opt):
@@ -398,6 +408,31 @@ class Seq2seqAgent(Agent):
         """Zero out optimizer."""
         self.optimizer.zero_grad()
 
+    def update(self, prediction, labels, N=-1):
+        # Exact match metric.
+        correct = 0
+
+        if prediction is not None:
+            if _exact_match(prediction, labels):
+                correct = 1
+            self.n_metrics[N]['correct'] += correct
+            self.n_metrics[N]['correct_cnt'] += 1
+            #print('\n\nmodify accuracy')
+            tmp_acc = round_sigfigs(self.n_metrics[N]['correct'] / max(1, self.n_metrics[N]['correct_cnt']), 4)
+            self.n_metrics[N]['accuracy'] = tmp_acc
+            #print('s2s_acc:',tmp_acc,'\n\n')
+
+            # F1 metrics.
+            #print('\n\nmodify f1')
+            f1 = _f1_score(prediction, labels)
+            self.n_metrics[N]['f1'] += f1
+            self.n_metrics[N]['f1_cnt'] += 1
+            tmp_f1=round_sigfigs(self.n_metrics[N]['f1'] / max(1, self.n_metrics[N]['f1_cnt']), 4)
+            self.n_metrics[N]['f1_score'] = tmp_f1
+            #print('s2s_f1:',tmp_f1,'\n\n')
+        return (correct, f1)
+ 
+
     def update_params(self):
         """Do one optimization step."""
         if self.clip > 0:
@@ -418,12 +453,22 @@ class Seq2seqAgent(Agent):
         self.metrics['num_tokens'] = 0
         self.metrics['correct_tokens'] = 0
 
-    def report(self):
+        # reset n_metrics
+        for i in range(len(self.n_metrics)):
+            self.n_metrics[i]['loss'] = 0.0
+            self.n_metrics[i]['num_tokens'] = 0
+            self.n_metrics[i]['correct_tokens'] = 0
+            self.n_metrics[i]['f1'] = 0.0
+            self.n_metrics[i]['accuracy'] = 0.0
+
+    def report(self, N=-1):
         """Report loss and perplexity from model's perspective.
 
         Note that this includes predicting __END__ and __UNK__ tokens and may
         differ from a truly independent measurement.
         """
+
+        '''
         m = {}
         num_tok = self.metrics['num_tokens']
         if num_tok > 0:
@@ -440,6 +485,44 @@ class Seq2seqAgent(Agent):
             # clean up: rounds to sigfigs and converts tensors to floats
             m[k] = round_sigfigs(v, 4)
         return m
+        '''
+        
+        # n_metrics version
+        if N==-1:
+            m = [{} for _ in range(len(self.n_metrics))]
+            for i in range(len(self.n_metrics)):
+                num_tok = self.n_metrics[i]['num_tokens']
+                m[i]['loss'] = self.n_metrics[i]['loss'] / num_tok
+                m[i]['ppl'] = math.exp(m[i]['loss'])
+                m[i]['f1'] = self.n_metrics[i]['f1_score']
+                m[i]['accuracy'] = self.n_metrics[i]['accuracy']
+                for k, v in m[i].items():
+                    m[i][k] = round_sigfigs(v, 4)
+            return m
+
+        m = {}
+        num_tok_N = self.n_metrics[N]['num_tokens']
+        if num_tok_N > 0:
+            if self.n_metrics[N]['correct_tokens'] > 0:
+                m['token_acc'] = self.n_metrics[N]['correct_tokens'] / num_tok_N
+            m['loss'] = self.n_metrics[N]['loss'] / num_tok_N
+            try:
+                m['ppl'] = math.exp(m['loss'])
+            except OverflowError:
+                m['ppl'] = float('inf')
+        #if self.n_metrics[N]['total_skipped_batches'] > 0:
+        #    m['total_skipped_batches'] = self.n_metrics[N]['total_skipped_batches']
+
+        # f1 and accuracy
+        m['f1'] = self.n_metrics[N]['f1_score']
+        m['accuracy'] = self.n_metrics[N]['accuracy']
+
+        for k, v in m.items():
+            # clean up: rounds to sigfigs and converts tensors to floats
+            m[k] = round_sigfigs(v, 4)
+
+        return m
+        
 
     def share(self):
         """Share internal states between parent and child instances."""
@@ -485,7 +568,7 @@ class Seq2seqAgent(Agent):
         self.answers[self.batch_idx] = None
         return obs
 
-    def predict(self, xs, ys=None, cands=None, valid_cands=None, is_training=False):
+    def predict(self, xs, ys=None, cands=None, valid_cands=None, is_training=False, noise=0):
         """Produce a prediction from our model.
 
         Update the model using the targets if available, otherwise rank
@@ -536,13 +619,23 @@ class Seq2seqAgent(Agent):
                 loss = self.criterion(score_view, ys.view(-1))
                 # save loss to metrics
                 target_tokens = ys.ne(self.NULL_IDX).long().sum().item()
-                self.metrics['loss'] += loss.item()
-                self.metrics['num_tokens'] += target_tokens
 
-        return predictions, cand_preds
+                # n metrics
+                #print('loss before:',self.n_metrics[noise]['loss'])
+                self.n_metrics[noise]['loss'] += loss.item()
+                self.n_metrics[noise]['num_tokens'] += target_tokens
+                #print('loss after:',self.n_metrics[noise]['loss'])
+
+                #self.metrics['loss'] += loss.item()
+                #self.metrics['num_tokens'] += target_tokens
+                #print('predict loss metrics:',self.metrics['loss'])
+
+        return predictions, cand_preds, loss.item(), target_tokens
 
     def vectorize(self, observations):
         """Convert a list of observations into input & target tensors."""
+        #print('vectorize_t2v:',observations[0]['text2vec'])
+
         is_training = any(['labels' in obs for obs in observations])
         xs, ys, labels, valid_inds, _, _ = PaddingUtils.pad_text(
             observations, self.dict, end_idx=self.END_IDX,
@@ -550,6 +643,8 @@ class Seq2seqAgent(Agent):
             truncate=self.truncate)
         if xs is None:
             return None, None, None, None, None, None, None
+        #print('xs:',xs)
+        #print('ys:',ys)
         xs = torch.LongTensor(xs)
         if ys is not None:
             ys = torch.LongTensor(ys)
@@ -597,7 +692,35 @@ class Seq2seqAgent(Agent):
                 else:
                     raise e
 
+    def update_from_n(self, n, correct, f1, loss, target_tokens):
+        for i in range(n+1,self.N+1):
+            self.n_metrics[i]['correct'] += correct
+            self.n_metrics[i]['correct_cnt'] += 1
+            tmp_acc = round_sigfigs(self.n_metrics[i]['correct'] / max(1, self.n_metrics[i]['correct_cnt']), 4)
+            self.n_metrics[i]['accuracy'] = tmp_acc
+            #print('s2s_acc:',tmp_acc,'\n\n')
+
+            # F1 metrics.
+            self.n_metrics[i]['f1'] += f1
+            self.n_metrics[i]['f1_cnt'] += 1
+            tmp_f1=round_sigfigs(self.n_metrics[i]['f1'] / max(1, self.n_metrics[i]['f1_cnt']), 4)
+            self.n_metrics[i]['f1_score'] = tmp_f1
+            #print('s2s_f1:',tmp_f1,'\n\n')
+
+            # loss
+            self.n_metrics[i]['loss'] += loss
+            self.n_metrics[i]['num_tokens'] += target_tokens
+
+
+
     def batch_act(self, observations):
+        try:
+            text_file = open('/home/benzischeap/ParlAI/result/'+str(self.noise_op)+'_output.txt','a')
+        except IOError:
+            text_file = open('/home/benzischeap/ParlAI/result/'+str(self.noise_op)+'output.txt','w')
+
+        print('\n\nnew batch')
+        text_file.write('\n\nnew batch\n')
         batchsize = len(observations)
         self.init_cuda_buffer(batchsize)
         # initialize a table of replies with this agent's id
@@ -607,35 +730,108 @@ class Seq2seqAgent(Agent):
         # valid_inds tells us the indices of all valid examples
         # e.g. for input [{}, {'text': 'hello'}, {}, {}], valid_inds is [1]
         # since the other three elements had no 'text' field
-        xs, ys, labels, valid_inds, cands, valid_cands, is_training = self.vectorize(observations)
+        #N = 10
+        original_predictions = []
+        for l in range(self.N+1):
+            print('l:',l)
+            text_file.write('l: '+str(l)+'\n')
+            original_x = []
+            if self.opt['datatype'] in ['valid', 'test']:
+                observations, original_x = noise_op(observations, self.noise_op, batchsize, self.dict, original_x, l, text_file)
+                '''
+                for i in range(batchsize):
+                    if 'text' in observations[i].keys():
+                        print('original-',i,':',observations[i]['text'])
+                        original_x.append((i,observations[i]['text']))
+                        if observations[i]['text']!='<SILENCE>' and l!=0:
+                            text_split = original_x[-1][1].split(' ')
+                            n = random.randint(0,len(text_split)-1)
+                            word = text_split[n]
+                            w = self.natural(word)
+                            text_split[n] = w
+                            scramble_x = ' '.join(text_split)
+                            observations[i]['text'] = scramble_x
+                            #print('noise-',i,':',observations[i]['text'])
+                            #observations[i]['text'] = 'hi'
+                            observations[i]['text2vec'] = self.parse(observations[i]['text'])
+                            print('noise-',i,':',observations[i]['text'])
+                '''
 
-        if xs is None:
-            # no valid examples, just return empty responses
-            return batch_reply
+            xs, ys, labels, valid_inds, cands, valid_cands, is_training = self.vectorize(observations)
 
-        # produce predictions, train on targets if availables
-        cand_inds = [i[0] for i in valid_cands] if valid_cands is not None else None
-        predictions, cand_preds = self.predict(xs, ys, cands, cand_inds, is_training)
+            if xs is None:
+                # no valid examples, just return empty responses
+                return batch_reply
 
-        if is_training:
-            report_freq = 0
-        else:
-            report_freq = self.report_freq
-        if predictions is not None:
-            PaddingUtils.map_predictions(
-                predictions, valid_inds, batch_reply, observations,
-                self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
-                answers=self.answers, ys=ys.data if ys is not None else None)
+            # produce predictions, train on targets if availables
+            cand_inds = [i[0] for i in valid_cands] if valid_cands is not None else None
+            predictions, cand_preds, loss, target_tokens= self.predict(xs, ys, cands, cand_inds, is_training, noise=l)
 
-        if cand_preds is not None:
-            if valid_cands is None:
-                valid_cands = [(None, i, labels) for i in valid_inds]
-            for i in range(len(valid_cands)):
-                order = cand_preds[i]
-                _, batch_idx, curr_cands = valid_cands[i]
-                curr = batch_reply[batch_idx]
-                curr['text_candidates'] = [curr_cands[idx] for idx in order
-                                           if idx < len(curr_cands)]
+            if is_training:
+                report_freq = 0
+            else:
+                report_freq = self.report_freq
+            if predictions is not None:
+                PaddingUtils.map_predictions(
+                    predictions, valid_inds, batch_reply, observations,
+                    self.dict, self.END_IDX, report_freq=report_freq, labels=labels,
+                    answers=self.answers, ys=ys.data if ys is not None else None)
+
+            if cand_preds is not None:
+                if valid_cands is None:
+                    valid_cands = [(None, i, labels) for i in valid_inds]
+                for i in range(len(valid_cands)):
+                    order = cand_preds[i]
+                    _, batch_idx, curr_cands = valid_cands[i]
+                    curr = batch_reply[batch_idx]
+                    curr['text_candidates'] = [curr_cands[idx] for idx in order
+                                               if idx < len(curr_cands)]
+
+
+            # f1 and accuracy
+            for i in range(batchsize):
+                (correct, f1) = self.update(batch_reply[i]['text'],observations[i]['eval_labels'],N=l)
+
+
+            if l==0:
+                for j in range(batchsize):
+                    if 'text' in batch_reply[j].keys():
+                        original_predictions.append((j,batch_reply[j]['text']))
+                original_reply = batch_reply
+                noise_reply = batch_reply
+            else:
+                #for j in range(len(original_predictions)):
+                if 'text' in batch_reply[j].keys():
+                    idx, txt = original_predictions[0]
+                    if batch_reply[idx]['text']!= txt:
+                        noise_predictions = batch_reply[idx]['text']
+                        noise_reply = batch_reply
+                        print('original_reply:',txt)
+                        print('noise_reply:',noise_predictions)
+                        text_file.write('original_reply: '+txt+'\n')
+                        text_file.write('noise_reply: '+noise_predictions+'\n')
+                        # update metrics after l
+                        self.update_from_n(l, correct, f1, loss, target_tokens)
+                        break
+
+            for i in range(batchsize):
+                if 'text' in observations[i].keys():
+                    print('reply-',i,':',batch_reply[i]['text'])
+                    print('label-',i,':',observations[i]['eval_labels'])
+                    text_file.write('reply-'+str(i)+': '+ batch_reply[i]['text']+'\n')
+                    text_file.write('label-'+str(i)+': '+ str(observations[i]['eval_labels'])+'\n')
+
+            for i in range(len(original_x)):
+                if 'text' in observations[i].keys():
+                    idx, txt = original_x[i]
+                    observations[idx]['text'] = txt
+                    observations[idx]['text2vec'] = self.parse(txt)
+
+            m = self.report(l)
+            print('m-',l,':',m)
+
+        batch_reply = noise_reply
+        text_file.close()
 
         return batch_reply
 
