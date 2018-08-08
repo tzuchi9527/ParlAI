@@ -54,9 +54,13 @@ except ImportError:
     from multiprocessing import Process, Value, Condition, Semaphore
 from parlai.core.agents import _create_task_agents, create_agents_from_shared
 from parlai.core.metrics import aggregate_metrics, compute_time_metrics
-from parlai.core.utils import Timer, display_messages
+from parlai.core.utils import Timer, display_messages, plot_result, save_report2txt
 from parlai.tasks.tasks import ids_to_tasks
 
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+import numpy as np
 
 def validate(observation):
     """Make sure the observation table is valid, or raise an error."""
@@ -263,22 +267,62 @@ class DialogPartnerWorld(World):
         show_metrics = self.opt.get('metrics', "all")
         self.show_metrics = show_metrics.split(',')
         metrics = {}
+        n_metrics = []
         for a in self.agents:
             if hasattr(a, 'report'):
                 m = a.report()
-                for k, v in m.items():
-                    if k not in metrics:
-                        # first agent gets priority in settings values for keys
-                        # this way model can't e.g. override accuracy to 100%
-                        if show(k):
-                            metrics[k] = v
+                print('report:',m)
+                if type(m) is not type(metrics):
+                    for i in range(len(m)):
+                        for k, v in m[i].items():
+                            if k not in metrics:
+                                # first agent gets priority in settings values for keys
+                                # this way model can't e.g. override accuracy to 100%
+                                if show(k):
+                                    metrics[k] = v
+                        n_metrics.append(metrics)
+                    print('plot result...')
+                    print('plot result:',m)
+                    save_report2txt(str(m), title='fully_random_noise')
+                    plot_result(m, title='fully_random_noise')
+                    print('Done')
+
+                else:
+                    for k, v in m.items():
+                        if k not in metrics:
+                            # first agent gets priority in settings values for keys
+                            # this way model can't e.g. override accuracy to 100%
+                            if show(k):
+                                metrics[k] = v
         if metrics:
             if compute_time and 'exs' in metrics:
                 self.total_exs += metrics['exs']
                 time_metrics = compute_time_metrics(self, self.opt['max_train_time'])
                 metrics.update(time_metrics)
             return metrics
+            #return n_metrics
+    '''
+    def plot_result(self,report):
+        title = 'Natural_noise'
+        keys=[]
+        for k in report[0].keys():
+            keys.append(k)
+        #print('keys:',keys)
 
+        plot = []
+        for i in range(len(keys)):
+            plot.append([tmp[keys[i]] for tmp in report])
+        #print('plot:',plot)
+
+        N = np.arange(0,len(plot[0]))
+        for i in range(len(keys)):
+            plt.plot(N,plot[i],label=keys[i])
+        plt.title(title)
+        plt.legend()
+        # save the plot
+        path = '/home/benzischeap/result/'
+        plt.savefig(path+title+'.png')
+    '''
     def num_examples(self):
         if hasattr(self.agents[0], 'num_examples'):
             return self.agents[0].num_examples()
